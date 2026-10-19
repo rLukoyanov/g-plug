@@ -1,38 +1,133 @@
-import React, { useMemo, useState, useEffect, useRef } from 'react';
-import {
-  alignTimeRangeCompareData,
-  AnnotationChangeEvent,
-  DashboardLoadedEvent,
-  DataFrame,
-  FieldType,
-  PanelProps,
-  shouldAlignTimeCompare,
-} from '@grafana/data';
-import { TooltipDisplayMode, SortOrder } from '@grafana/schema';
+import React, { useEffect, useMemo } from 'react';
+import { alignTimeRangeCompareData, DataFrame, FieldType, PanelProps, shouldAlignTimeCompare } from '@grafana/data';
+import { LegendDisplayMode, TooltipDisplayMode, SortOrder, VizLegendOptions } from '@grafana/schema';
 import { SimpleOptions } from 'types';
 import { css, cx } from '@emotion/css';
 import { TimeSeries, useStyles2, TooltipPlugin } from '@grafana/ui';
-import { config, PanelDataErrorView, getDataSourceSrv, getAppEvents } from '@grafana/runtime';
-import { lastValueFrom, from } from 'rxjs';
+import { config, getDataSourceSrv, PanelDataErrorView } from '@grafana/runtime';
 import { prepareGraphableFields } from './utils';
 
 interface Props extends PanelProps<SimpleOptions> {}
+
+const BASELINE_REF_ID = 'BASELINE';
+const REF_ID_B = 'B';
+const REF_ID_C = 'C';
+const COLOR_B = '#73BF69';
+const COLOR_C = '#F2495C';
+
+type QueryModel = Record<string, unknown> & { refId?: string };
+type QueryTab = {
+  onAddQuery: (query: QueryModel) => void;
+  getQueries: () => QueryModel[];
+  onQueriesChange: (queries: QueryModel[]) => void;
+};
+
+const getPrimaryDatasourceType = (datasourceType: string | undefined) => {
+  const first = datasourceType?.split(',')[0]?.trim().toLowerCase();
+  return first ?? '';
+};
+
+const buildBaselineQuery = (datasourceType: string | undefined, uid: string | undefined): QueryModel => {
+  const primaryType = getPrimaryDatasourceType(datasourceType);
+
+  if (primaryType.includes('prometheus')) {
+    return {
+      refId: BASELINE_REF_ID,
+      expr: 'up',
+      legendFormat: uid ? `uid:${uid}` : undefined,
+    };
+  }
+
+  if (primaryType.includes('druid')) {
+    return {
+      refId: BASELINE_REF_ID,
+      queryType: 'sql',
+      sql: `-- uid: ${uid ?? 'unknown'}\nSELECT\n  TIME_FLOOR(__time, 'PT1M') AS \"time\",\n  COUNT(*) AS \"value\"\nFROM \"${uid ?? 'table_name'}\"\nGROUP BY 1\nORDER BY 1`,
+    };
+  }
+
+  return { refId: BASELINE_REF_ID };
+};
+
+const getQueryTab = (): QueryTab | undefined => {
+  const sceneContext = (window as any).__grafanaSceneContext;
+  return sceneContext?.state?.editPanel?.state?.dataPane?.state?.tabs?.[0] as QueryTab | undefined;
+};
+
+const setLastQueryAsBaseline = (queryTab: QueryTab, datasourceType: string | undefined, uid: string | undefined) => {
+  const currentQueries = queryTab.getQueries();
+  if (!Array.isArray(currentQueries) || currentQueries.length === 0) {
+    return;
+  }
+
+  const lastIndex = currentQueries.length - 1;
+  const updatedQueries = [...currentQueries];
+  const baselineQuery = buildBaselineQuery(datasourceType, uid);
+
+  updatedQueries[lastIndex] = {
+    ...updatedQueries[lastIndex],
+    ...baselineQuery,
+    refId: BASELINE_REF_ID,
+  };
+
+  queryTab.onQueriesChange(updatedQueries);
+};
+
+const applyAutoOffsetColors = (frames: DataFrame[]) => {
+  for (const frame of frames) {
+    const color = frame.refId === REF_ID_B ? COLOR_B : frame.refId === REF_ID_C ? COLOR_C : undefined;
+    if (!color) {
+      continue;
+    }
+
+    for (const field of frame.fields) {
+      if (field.type === FieldType.number) {
+        field.config = {
+          ...field.config,
+          color: { mode: 'fixed', fixedColor: color },
+        };
+      }
+    }
+  }
+};
+
+const resolveDatasourceTypes = async (targets: Array<Record<string, any>>) => {
+  const found = new Set<string>();
+
+  for (const target of targets) {
+    const datasource = target?.datasource;
+    if (!datasource) {
+      continue;
+    }
+
+    if (typeof datasource === 'object' && datasource.type) {
+      found.add(datasource.type);
+      continue;
+    }
+
+    const uid = typeof datasource === 'object' ? datasource.uid : undefined;
+    if (!uid) {
+      continue;
+    }
+
+    try {
+      const instance = await getDataSourceSrv().get(uid);
+      const type = instance?.meta?.id;
+      if (type) {
+        found.add(type);
+      }
+    } catch {
+      // Ignore failed datasource resolution and continue with other targets.
+    }
+  }
+
+  return Array.from(found);
+};
 
 const getStyles = () => ({
   wrapper: css`
     font-family: Open Sans;
     position: relative;
-  `,
-  svg: css`
-    position: absolute;
-    top: 0;
-    left: 0;
-  `,
-  textBox: css`
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    padding: 10px;
   `,
 });
 
@@ -43,171 +138,76 @@ export const SimplePanel: React.FC<Props> = ({
   height,
   fieldConfig,
   id,
+  onOptionsChange,
+  timeZone,
   timeRange,
-  eventBus,
 }) => {
   const styles = useStyles2(getStyles);
-  const [additionalFrames, setAdditionalFrames] = useState<DataFrame[]>([]);
-  const urlRef = useRef(options.mountEventUrl);
-  urlRef.current = options.mountEventUrl;
-
-  eventBus.subscribe(AnnotationChangeEvent, console.log);
 
   useEffect(() => {
-    return () => {
-      const url = urlRef.current;
-      if (url) {
-        navigator.sendBeacon(
-          url,
-          JSON.stringify({
-            event: 'panel-deleted',
-            panelId: id,
-            timestamp: Date.now(),
-          })
-        );
-      }
-    };
-  }, []);
+    if (!options.uid) {
+      const generatedUid =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `panel-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+      onOptionsChange({
+        ...options,
+        uid: generatedUid,
+      });
+    }
+  }, [onOptionsChange, options]);
 
   useEffect(() => {
-    if (!options.mountEventUrl) {
+    const queryTab = getQueryTab();
+    if (!queryTab) {
       return;
     }
-    const sub = getAppEvents().subscribe(DashboardLoadedEvent, (event) => {
-      fetch(options.mountEventUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'dashboard-loaded',
-          dashboardId: event.payload.dashboardId,
-          panelId: id,
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-    });
-    return () => sub.unsubscribe();
-  }, [options.mountEventUrl, id]);
+
+    const currentQueries = queryTab.getQueries();
+    const hasBaselineQuery = currentQueries.some((query) => query?.refId === BASELINE_REF_ID);
+
+    if (!hasBaselineQuery) {
+      queryTab.onAddQuery({});
+
+      // Some query editors ignore incoming refId and assign the next letter (A/B/C),
+      // so we patch the last created query back to the desired custom refId.
+      setTimeout(() => {
+        setLastQueryAsBaseline(queryTab, options.datasourceType, options.uid);
+      }, 0);
+    }
+  }, [data.request, options.datasourceType, options.uid]);
 
   useEffect(() => {
-    if (!options.autoOffsetsEnabled) {
-      setAdditionalFrames([]);
-      return;
-    }
-
-    const targets = data.request?.targets;
-    if (!targets || targets.length === 0) {
-      return;
-    }
-
-    const baseTarget = targets.find((t) => t.refId === 'A') ?? targets[0];
-    const baseExpr = (baseTarget as unknown as Record<string, unknown>).expr as string | undefined;
-    if (!baseExpr) {
-      return;
-    }
-
-    const offset = options.offsetValue;
     let cancelled = false;
 
-    const run = async () => {
-      try {
-        const ds = await getDataSourceSrv().get(baseTarget.datasource);
-        if (cancelled) {
-          return;
-        }
+    const loadDatasourceTypes = async () => {
+      const targets = (data.request?.targets ?? []) as Array<Record<string, any>>;
+      const types = await resolveDatasourceTypes(targets);
+      const datasourceType = types.length > 0 ? types.join(', ') : 'unknown';
 
-        const plusTarget = {
-          ...baseTarget,
-          refId: 'B',
-          expr: `${baseExpr} + ${offset}`,
-        };
-        const minusTarget = {
-          ...baseTarget,
-          refId: 'C',
-          expr: `${baseExpr} - ${offset}`,
-        };
-
-        const response = await lastValueFrom(
-          from(
-            ds.query({
-              ...data.request!,
-              targets: [plusTarget, minusTarget],
-            })
-          )
-        );
-
-        if (cancelled || !response.data) {
-          return;
-        }
-
-        const renamed: DataFrame[] = response.data.map((frame: DataFrame) => {
-          const suffix = frame.refId === 'B' ? `+${offset}` : `-${offset}`;
-          return {
-            ...frame,
-            name: frame.name ? `${frame.name} ${suffix}` : suffix,
-            fields: frame.fields.map((field: DataFrame['fields'][number]) => {
-              if (field.type !== FieldType.time) {
-                const baseName = field.config?.displayName || field.name || frame.name || '';
-                return {
-                  ...field,
-                  config: {
-                    ...field.config,
-                    displayName: baseName ? `${baseName} ${suffix}` : suffix,
-                  },
-                };
-              }
-              return field;
-            }),
-          };
+      if (!cancelled && options.datasourceType !== datasourceType) {
+        onOptionsChange({
+          ...options,
+          datasourceType,
         });
-
-        setAdditionalFrames(renamed);
-      } catch {
-        if (!cancelled) {
-          setAdditionalFrames([]);
-        }
       }
     };
 
-    run();
+    loadDatasourceTypes();
 
     return () => {
       cancelled = true;
     };
-  }, [options.autoOffsetsEnabled, options.offsetValue, data.request]);
-
-  const allSeries = useMemo(() => {
-    if (additionalFrames.length === 0) {
-      return data.series;
-    }
-    return [...data.series, ...additionalFrames];
-  }, [data.series, additionalFrames]);
+  }, [data.request, onOptionsChange, options]);
 
   const { frames } = useMemo(() => {
-    let prepared = prepareGraphableFields(allSeries, config.theme2, timeRange);
+    let prepared = prepareGraphableFields(data.series, config.theme2, timeRange);
     if (prepared) {
       if (options.autoOffsetsEnabled) {
-        for (const frame of prepared) {
-          if (frame.refId === 'B') {
-            for (const field of frame.fields) {
-              if (field.type === FieldType.number) {
-                field.config = {
-                  ...field.config,
-                  color: { mode: 'fixed', fixedColor: '#73BF69' },
-                };
-              }
-            }
-          } else if (frame.refId === 'C') {
-            for (const field of frame.fields) {
-              if (field.type === FieldType.number) {
-                field.config = {
-                  ...field.config,
-                  color: { mode: 'fixed', fixedColor: '#F2495C' },
-                };
-              }
-            }
-          }
-        }
+        applyAutoOffsetColors(prepared);
       }
+
       prepared.forEach((frame: DataFrame) => {
         const diffMs = frame.meta?.timeCompare?.diffMs ?? 0;
         if (diffMs !== 0) {
@@ -219,20 +219,30 @@ export const SimplePanel: React.FC<Props> = ({
       });
       return { frames: prepared };
     }
-    return { frames: undefined };
-  }, [allSeries, timeRange, options.autoOffsetsEnabled]);
 
-  if (data.series.length === 0 || !frames || frames.length === 0) {
-    return <PanelDataErrorView fieldConfig={fieldConfig} panelId={id} data={data} needsStringField />;
-  }
+    return { frames: undefined };
+  }, [data.series, timeRange, options.autoOffsetsEnabled]);
 
   const timeSeriesOptions = useMemo(
     () => ({
-      legend: { displayMode: 'list', placement: 'bottom', showLegend: true, calcs: [] },
       tooltip: { mode: 'multi', sort: 'none' },
     }),
     []
   );
+
+  const legendOptions = useMemo<VizLegendOptions>(
+    () => ({
+      displayMode: LegendDisplayMode.List,
+      placement: 'bottom',
+      showLegend: true,
+      calcs: [],
+    }),
+    []
+  );
+
+  if (data.series.length === 0 || !frames || frames.length === 0) {
+    return <PanelDataErrorView fieldConfig={fieldConfig} panelId={id} data={data} needsStringField />;
+  }
 
   return (
     <div
@@ -248,10 +258,10 @@ export const SimplePanel: React.FC<Props> = ({
         frames={frames}
         width={width}
         height={height}
+        legend={legendOptions}
         options={timeSeriesOptions}
-        timeZone={config.timezone}
+        timeZone={timeZone}
         timeRange={timeRange}
-        legend={timeSeriesOptions.legend}
       >
         {(builder, alignedFrame) => (
           <TooltipPlugin
@@ -259,7 +269,7 @@ export const SimplePanel: React.FC<Props> = ({
             data={alignedFrame}
             mode={TooltipDisplayMode.Multi}
             sortOrder={SortOrder.None}
-            timeZone={config.timezone}
+            timeZone={timeZone}
           />
         )}
       </TimeSeries>

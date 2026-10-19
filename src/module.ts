@@ -5,6 +5,18 @@ import { SimplePanel } from './components/SimplePanel';
 export const plugin = new PanelPlugin<SimpleOptions>(SimplePanel).setPanelOptions((builder) => {
   return builder
     .addTextInput({
+      path: 'uid',
+      name: 'UID',
+      description: 'Auto-generated unique identifier for this panel instance',
+      defaultValue: '',
+    })
+    .addTextInput({
+      path: 'datasourceType',
+      name: 'Datasource type',
+      description: 'Auto-detected datasource type from panel queries',
+      defaultValue: '',
+    })
+    .addTextInput({
       path: 'text',
       name: 'Simple text option',
       description: 'Description of panel option',
